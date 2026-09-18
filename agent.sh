@@ -202,7 +202,7 @@ ${details}"
 die() {
     err "$*"
     notify_result failed
-    cleanup
+    rm -f "$TEMP_BINARY"
     exit 1
 }
 
@@ -589,7 +589,7 @@ install_agent() {
     fi
     run_as_root cp -f "$TEMP_BINARY" "$target_binary" || die "Could not install the verified binary."
     run_as_root chmod 755 "$target_binary" || die "Could not set executable permissions."
-    cleanup
+    rm -f "$TEMP_BINARY"
 
     path="$(choose_config_path)"
     run_as_root "$target_binary" service -c "$path" uninstall >/dev/null 2>&1 || true
