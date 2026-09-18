@@ -18,11 +18,14 @@ plain='\033[0m'
 
 LOG_FILE="${TMPDIR:-/tmp}/nezha-agent-install.$$.log"
 TEMP_BINARY="${TMPDIR:-/tmp}/nezha-agent.download.$$"
+DEBUG_OUTPUT="${TMPDIR:-/tmp}/nezha-agent-debug.$$.log"
+DEBUG_COMMAND_FILE="${TMPDIR:-/tmp}/nezha-agent-debug-command.$$"
 NOTIFICATION_SENT=0
 DOWNLOAD_TOOL=""
 
 cleanup() {
     rm -f "$TEMP_BINARY"
+    rm -f "$DEBUG_OUTPUT" "$DEBUG_COMMAND_FILE"
     [ "$LOG_FILE" = /dev/null ] || rm -f "$LOG_FILE"
 }
 
@@ -153,14 +156,18 @@ send_telegram_message() {
         fi
     fi
     append_log "WARN: Telegram notification failed or no compatible HTTP POST client was found"
-    return 0
+    return 1
 }
 
-sanitize_log() {
-    if [ ! -r "$LOG_FILE" ]; then
+sanitize_file() {
+    input_file="$1"
+    max_lines="${2:-20}"
+    max_columns="${3:-140}"
+
+    if [ ! -r "$input_file" ]; then
         return 0
     fi
-    awk -v secret="${NZ_CLIENT_SECRET:-}" -v uuid="${NZ_UUID:-}" '
+    awk -v secret="${NZ_CLIENT_SECRET:-}" -v uuid="${NZ_UUID:-}" -v bot_token="${TG_BOT_TOKEN:-}" '
         {
             line = $0
             if (length(secret) > 0) {
@@ -173,14 +180,23 @@ sanitize_log() {
                     line = substr(line, 1, position - 1) "***" substr(line, position + length(uuid))
                 }
             }
+            if (length(bot_token) > 0) {
+                while ((position = index(line, bot_token)) > 0) {
+                    line = substr(line, 1, position - 1) "***" substr(line, position + length(bot_token))
+                }
+            }
             print line
         }
-    ' "$LOG_FILE" | sed \
+    ' "$input_file" | sed \
         -e 's/\(NZ_CLIENT_SECRET[=:][[:space:]]*\)[^[:space:]]*/\1***/g' \
         -e 's/\([Cc]lient[_ -]*[Ss]ecret[=:][[:space:]]*\)[^[:space:]]*/\1***/g' \
         -e 's/\(NZ_UUID[=:][[:space:]]*\)[^[:space:]]*/\1***/g' \
         -e 's/\(TG_BOT_TOKEN[=:][[:space:]]*\)[^[:space:]]*/\1***/g' | \
-        tail -n 20 | cut -c 1-140
+        tail -n "$max_lines" | cut -c "1-$max_columns"
+}
+
+sanitize_log() {
+    sanitize_file "$LOG_FILE" 20 140
 }
 
 notify_result() {
@@ -208,7 +224,11 @@ TLS: ${NZ_TLS:-false}
 
 Install log:
 ${details}"
-    send_telegram_message "$message"
+    if ! send_telegram_message "$message"; then
+        err "Telegram notification failed. Check network access, Bot Token, Chat ID, and HTTP POST support."
+        return 1
+    fi
+    return 0
 }
 
 die() {
@@ -642,6 +662,87 @@ check_download() {
     rm -f "$LOG_FILE"
 }
 
+collect_debug_context() {
+    SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
+    MACHINE="$(uname -m 2>/dev/null || printf unknown)"
+    detect_package_abi
+
+    OS_DETAILS=""
+    if [ -r /etc/openwrt_release ]; then
+        OS_DETAILS="$(sed -n 's/^DISTRIB_DESCRIPTION=//p' /etc/openwrt_release 2>/dev/null | head -n 1 | sed "s/^['\"]//;s/['\"]$//")"
+    elif [ -r /etc/os-release ]; then
+        OS_DETAILS="$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n 1 | sed 's/^"//;s/"$//')"
+    fi
+    [ -n "$OS_DETAILS" ] || OS_DETAILS="$SYSTEM"
+
+    DEBUG_CPU_DETAILS="$(sed -n \
+        -e 's/^system type[[:space:]]*:[[:space:]]*/system=/p' \
+        -e 's/^model name[[:space:]]*:[[:space:]]*/model=/p' \
+        -e 's/^CPU architecture[[:space:]]*:[[:space:]]*/architecture=/p' \
+        -e 's/^[Ff]eatures[[:space:]]*:[[:space:]]*/features=/p' \
+        "$CPUINFO_PATH" 2>/dev/null | head -n 4 | tr '\n' ';' | cut -c 1-300)"
+    [ -n "$DEBUG_CPU_DETAILS" ] || DEBUG_CPU_DETAILS="not available"
+}
+
+run_debug_command() {
+    debug_command="$1"
+
+    [ -n "$debug_command" ] || {
+        err "Debug command must not be empty."
+        return 2
+    }
+    [ -n "${TG_BOT_TOKEN:-}" ] || {
+        err "TG_BOT_TOKEN is required in command debug mode."
+        return 2
+    }
+    [ -n "${TG_CHAT_ID:-}" ] || {
+        err "TG_CHAT_ID is required in command debug mode."
+        return 2
+    }
+
+    collect_debug_context
+    printf '%s\n' "$debug_command" > "$DEBUG_COMMAND_FILE"
+    info "Command debug mode: no installation or binary download will be performed."
+    info "Executing: $debug_command"
+
+    sh -c "$debug_command" > "$DEBUG_OUTPUT" 2>&1
+    command_status=$?
+
+    if [ -s "$DEBUG_OUTPUT" ]; then
+        cat "$DEBUG_OUTPUT"
+    else
+        printf '%s\n' '(command produced no output)'
+    fi
+
+    command_for_message="$(sanitize_file "$DEBUG_COMMAND_FILE" 3 300)"
+    output_for_message="$(sanitize_file "$DEBUG_OUTPUT" 20 120)"
+    [ -n "$output_for_message" ] || output_for_message="(no output)"
+    host_name="$(hostname 2>/dev/null || uname -n 2>/dev/null || printf unknown)"
+    kernel="$(uname -sr 2>/dev/null || printf unknown)"
+    message="Nezha command debug
+Host: ${host_name}
+Kernel: ${kernel}
+System: ${OS_DETAILS}
+uname -m: ${MACHINE}
+Package ABI: ${PACKAGE_ABI:-none}
+CPU: ${DEBUG_CPU_DETAILS}
+Command: ${command_for_message}
+Exit code: ${command_status}
+
+Output (last 20 lines):
+${output_for_message}"
+
+    if send_telegram_message "$message"; then
+        success "Telegram command result notification sent (exit code: $command_status)."
+    else
+        err "Telegram command result notification failed."
+        [ "$command_status" -ne 0 ] && return "$command_status"
+        return 1
+    fi
+
+    return "$command_status"
+}
+
 uninstall_agent() {
     found=0
     for file in "$NZ_AGENT_PATH"/config*.yml; do
@@ -670,12 +771,27 @@ case "${1:-}" in
     --check-download)
         check_download
         ;;
+    --debug-command)
+        shift
+        [ "$#" -gt 0 ] || {
+            err "Usage: sh agent.sh --debug-command 'command'"
+            exit 2
+        }
+        run_debug_command "$*"
+        exit $?
+        ;;
+    --debug-command=*)
+        debug_command_value="${1#--debug-command=}"
+        run_debug_command "$debug_command_value"
+        exit $?
+        ;;
     --help|-h)
         cat <<'EOF'
 Usage:
   env NZ_SERVER=host:port NZ_CLIENT_SECRET=secret [NZ_TLS=false] sh agent.sh
   sh agent.sh --detect
   sh agent.sh --check-download
+  env TG_BOT_TOKEN=token TG_CHAT_ID=chat sh agent.sh --debug-command 'command'
   sh agent.sh uninstall
 
 Optional environment variables:
@@ -683,6 +799,9 @@ Optional environment variables:
   NZ_DISABLE_AUTO_UPDATE, NZ_DISABLE_FORCE_UPDATE
   NZ_DISABLE_COMMAND_EXECUTE, NZ_SKIP_CONNECTION_COUNT
   TG_BOT_TOKEN, TG_CHAT_ID
+
+Command debug mode executes the trusted command through /bin/sh -c, sends its
+combined output and exit code to Telegram, and does not install Nezha Agent.
 
 NZ_ARCH values: amd64, 386, arm5, arm6, arm64, mips, mipsle,
                 riscv64, s390x, loong64
