@@ -100,10 +100,22 @@ download_to() {
 }
 
 url_encode() {
-    has_cmd od || return 1
-    printf '%s' "$1" | od -An -tx1 -v | tr ' ' '\n' | while read -r hex; do
-        [ -n "$hex" ] && printf '%%%s' "$hex"
-    done
+    # Encode the form separators and whitespace used by our Telegram payload.
+    # BusyBox awk is available on minimal OpenWrt images where the od applet is not.
+    printf '%s' "$1" | awk '
+        BEGIN { ORS = "" }
+        {
+            if (NR > 1) printf "%%0A"
+            gsub(/%/, "%25")
+            gsub(/\+/, "%2B")
+            gsub(/&/, "%26")
+            gsub(/=/, "%3D")
+            gsub(/\r/, "%0D")
+            gsub(/\t/, "%09")
+            gsub(/ /, "+")
+            printf "%s", $0
+        }
+    '
 }
 
 send_telegram_message() {
@@ -122,19 +134,19 @@ send_telegram_message() {
             return 0
         fi
     fi
-    if has_cmd wget && has_cmd od; then
+    if has_cmd wget; then
         post_data="chat_id=$(url_encode "$TG_CHAT_ID")&text=$(url_encode "$message")&disable_web_page_preview=true"
         if wget -qO- --post-data="$post_data" "$api_url" >/dev/null 2>&1; then
             return 0
         fi
     fi
-    if has_cmd uclient-fetch && has_cmd od; then
+    if has_cmd uclient-fetch; then
         post_data="chat_id=$(url_encode "$TG_CHAT_ID")&text=$(url_encode "$message")&disable_web_page_preview=true"
         if uclient-fetch -qO- --post-data="$post_data" "$api_url" >/dev/null 2>&1; then
             return 0
         fi
     fi
-    if has_cmd busybox && has_cmd od && busybox wget --help 2>&1 | grep -q -- '--post-data'; then
+    if has_cmd busybox && busybox wget --help 2>&1 | grep -q -- '--post-data'; then
         post_data="chat_id=$(url_encode "$TG_CHAT_ID")&text=$(url_encode "$message")&disable_web_page_preview=true"
         if busybox wget -qO- --post-data="$post_data" "$api_url" >/dev/null 2>&1; then
             return 0
